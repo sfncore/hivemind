@@ -6,12 +6,16 @@
 ---
 
 ## Table of Contents
-
 1. [Server / Runtime / ModuleBackend](#1-server--runtime--modulebackend)
 2. [DHT — Peer Discovery & Health Monitoring](#2-dht--peer-discovery--health-monitoring)
 3. [DecentralizedAverager — Gradient & State Averaging](#3-decentralizedaverager--gradient--state-averaging)
 4. [Collaborative Optimizer](#4-collaborative-optimizer)
 5. [libp2p Networking](#5-libp2p-networking)
+6. [Matchmaking & Group Formation](#6-matchmaking--group-formation)
+7. [Expert Routing — Batch Routing Between Pipeline Stages](#7-expert-routing--batch-routing-between-pipeline-stages)
+8. [Node0 ↔ Hivemind Integration Map](#8-node0--hivemind-integration-map)
+9. [Gap Analysis — Training](#9-gap-analysis--training)
+10. [Gap Analysis — Inference](#10-gap-analysis--inference)
 6. [Matchmaking & Group Formation](#6-matchmaking--group-formation)
 7. [Expert Routing — Batch Routing Between Pipeline Stages](#7-expert-routing--batch-routing-between-pipeline-stages)
 
@@ -731,4 +735,211 @@ Dict-like storage with automatic expiration. Uses min-heap for efficient cleanup
 **Class:** `PerformanceEMA` (line 7)
 
 Exponential moving average throughput tracker with bias correction. Thread-safe via lock.
-Used by ProgressTracker to estimate `samples_per_second`.
+
+---
+
+## 8. Node0 ↔ Hivemind Integration Map
+
+How Node0 (the training rig) maps onto Hivemind's APIs.
+
+### 8.1 Component Mapping
+
+| Node0 component | Hivemind API | Integration point |
+|---|---|---|
+| Model (LLaMA layers) | `ModuleBackend` wraps each expert/stage | `module_backend.py:45` — `ModuleBackend(module=nn.Module)` |
+| Pipeline experts (Head/Body/Tail) | `Server.create()` with expert UIDs | `server.py:88` — each stage registered as separate expert UID |
+| PowerSGD wrappers | `PowerSGDGradientAverager` | `power_sgd_averager.py:28` — rank-r gradient compression |
+| AutoStepOptimizer | `hivemind.Optimizer` wrapping local optimizer | `optimizer.py:32` — wraps any `torch.optim.Optimizer` |
+| Auth client (Pluralis) | `TokenAuthorizerBase` subclass | `utils/auth.py:49` — implement `get_token()` for Pluralis |
+| Peer discovery | `DHT` + `get_experts()` | `dht/dht.py:22` + `server/dht_handler.py:81` |
+| Config (YAML + run.json) | `Server.create()` kwargs or `hivemind-server` CLI | `hivemind_cli/run_server.py` — supports `--config config.yml` |
+
+### 8.2 Training Loop Contract
+
+Node0 defines *what* to train; Hivemind provides *how* to train it distributedly.
+
+```
+Node0 training loop:
+  model = define_model()               # Node0: LLaMA layers, pipeline stages
+  local_optim = torch.optim.AdamW(...)  # Node0: local optimizer
+
+  opt = hivemind.Optimizer(             # Hivemind: collaborative wrapper
+      dht=dht,
+      run_id="training_run",
+      target_batch_size=10000,          # global batch across all peers
+      batch_size_per_step=32,           # local batch per step() call
+      optimizer=local_optim,
+      use_local_updates=True,           # update locally, average in background
+  )
+  opt.load_state_from_peers()           # catch up if joining mid-training
+
+  for batch in dataloader:
+      loss = model(batch)
+      opt.zero_grad()
+      loss.backward()
+      opt.step()                        # internally: accumulate → track progress
+                                         #   → matchmaking → all-reduce → optimizer
+                                         #   → state averaging
+```
+
+### 8.3 Expert Hosting Pattern
+
+For MoE-style hosting, Node0 registers pipeline stages as experts:
+
+```python
+# Each stage is an independent expert with its own UID
+server = hivemind.Server.create(
+    expert_uids=["model.head", "model.body.0", "model.body.1", "model.tail"],
+    expert_cls=CustomExpertClass,     # register_expert_class("custom")
+    hidden_dim=4096,
+    initial_peers=DHT_PEERS,
+    optimizer=None,                    # or optim_cls for server-side training
+    start=True,
+)
+```
+
+### 8.4 Authentication Integration
+
+Node0's Pluralis auth client integrates via `TokenAuthorizerBase` subclass:
+
+```python
+class PluralAuthAuthorizer(TokenAuthorizerBase):
+    async def get_token(self) -> AccessToken:
+        # Call Pluralis API to get/refresh token
+        return await pluralis_client.get_access_token()
+
+    def is_token_valid(self, token) -> bool:
+        return token is not None and token.expiry > time.time()
+```
+
+The authorizer is passed to `DHT(authorizer=...)` and protects all RPC endpoints with
+RSA-signed requests and nonce replay prevention (`utils/auth.py:102–164`).
+
+---
+
+## 9. Gap Analysis — Training
+
+### 9.1 Pipeline Parallelism (HIGH)
+
+**Status:** Not supported. Hivemind's MoE grid is *parallel* expert routing, not
+sequential pipeline stages.
+
+The grid-based beam search (`beam_search.py:264`) selects k-best experts and executes
+them **in parallel** via `_RemoteCallMany` (`moe.py:192`). All selected experts receive
+the same input and their outputs are weighted-summed.
+
+Node0's Head → Body → Tail pipeline requires **sequential** data flow. Currently this
+must be composed manually by the client:
+
+```python
+# Manual sequential composition — no pipeline overlap
+head_out = head_expert(input)      # RPC call 1
+body_out = body_expert(head_out)   # RPC call 2 (waits for call 1)
+tail_out = tail_expert(body_out)   # RPC call 3 (waits for call 2)
+```
+
+**What's missing:**
+- No sequential dependency tracking between expert UIDs
+- No micro-batch pipeline scheduling (GPipe/PipeDream style overlap of fwd/bwd)
+- No stage-aware gradient flow optimization
+- No fault tolerance for pipeline stages (MoE has `k_min` fallback; pipeline doesn't)
+
+### 9.2 Backward Re-Runs Forward (MEDIUM)
+
+`ModuleBackend.backward()` (line 135) re-executes the forward pass with `enable_grad()`
+before calling `torch.autograd.backward()`. This doubles compute per backward step.
+
+- **Fine for:** Small MoE experts (FFN blocks)
+- **Expensive for:** Large LLaMA pipeline stages (billions of parameters per stage)
+- **Mitigation:** Could implement activation caching if memory allows, but Hivemind's
+  stateless design (Runtime doesn't guarantee fwd/bwd ordering) makes this non-trivial
+
+### 9.3 Heterogeneous Hardware (LOW)
+
+`ProgressTracker` (`progress_tracker.py:304`) estimates global ETA from per-peer
+`samples_per_second`. The throughput model assumes peers contribute proportionally to
+their speed, but doesn't account for:
+- Different GPU memory constraints (some peers can't handle large batches)
+- Network bandwidth asymmetry beyond what load balancing handles
+- Peers with mixed precision capabilities
+
+### 9.4 Optimizer State Size (LOW)
+
+`TrainingStateAverager` averages optimizer statistics (momentum, variance for AdamW)
+across peers. For large models, this state can be 2–3x the parameter count. The averaging
+round transmits all averaged tensors, which may be bandwidth-prohibitive for very large
+models without compression.
+
+PowerSGD (`power_sgd_averager.py`) compresses gradients but not optimizer state. State
+averaging uses `state_averaging_compression` which defaults to `NoCompression`.
+
+---
+
+## 10. Gap Analysis — Inference
+
+### 10.1 Inference Is Supported But Implicit
+
+Hivemind **does** support inference:
+- `ModuleBackend.__init__` accepts `optimizer=None` (`module_backend.py:45`)
+- `Server.create()` / CLI accepts `--optimizer none` (`run_server.py:91–99`)
+- `ModuleBackend.forward()` always runs under `torch.no_grad()` (`module_backend.py:100`)
+- Backward is a separate RPC — never auto-triggered
+- `RemoteExpert.forward()` works for inference out of the box
+
+**However**, there is no explicit inference mode flag. Inference happens implicitly when
+the optimizer is None and no backward calls are made.
+
+### 10.2 No Latency-Focused Scheduling (HIGH)
+
+`TaskPool` (`task_pool.py:59`) is throughput-optimized:
+- Waits for `min_batch_size` or `timeout` before processing
+- FIFO ordering by timestamp
+- No request deadlines, SLO targets, or priority classes
+
+For inference, you want minimal latency: process immediately if GPU is idle, or batch
+with a tight deadline (e.g., 10ms). The current batching strategy is designed for training
+throughput, not serving latency.
+
+### 10.3 No KV Cache / Autoregressive Support (HIGH)
+
+For LLM inference (autoregressive decoding), each token generation step needs access to
+the KV cache from previous steps. Hivemind's forward path is **stateless** — each
+`ModuleBackend.forward()` call is independent with no state carried between calls.
+
+Supporting autoregressive inference would require:
+- Per-session KV cache management on the server
+- Session affinity (route sequential tokens to the same server)
+- Cache eviction policies
+- Cache-aware request routing
+
+### 10.4 No Serving Infrastructure (MEDIUM)
+
+Missing production serving features:
+
+| Feature | Status |
+|---|---|
+| Health-check / readiness probes | Not implemented |
+| Model versioning / A-B routing | Not implemented |
+| Request metrics / monitoring | Partial (`StatsReporter` in `runtime.py:161`) |
+| Graceful draining | Not implemented (`shutdown()` is immediate) |
+| Rate limiting | Not implemented |
+| Request authentication | Available via `TokenAuthorizerBase` |
+
+### 10.5 DHT Discovery Latency (MEDIUM)
+
+Expert discovery via beam search queries the DHT per routing decision. For training this
+cost is amortized across many forward/backward steps. For inference, each request pays
+the discovery latency.
+
+**Mitigation available:** `MoEBeamSearcher` supports DHT result caching (`beam_search.py:77`
+— `allow_cache` parameter), and `negative_caching` to avoid re-querying missing experts.
+But cache invalidation on expert failure still incurs discovery delay.
+
+### 10.6 No Speculative / Continuous Batching (LOW)
+
+Modern inference servers (vLLM, TGI) use continuous batching to maximize GPU utilization.
+Hivemind's `TaskPool` uses fixed batching: accumulate until `min_batch_size` or `timeout`,
+then process as one batch. No support for:
+- Adding new requests to an in-flight batch
+- Preempting long-running requests
+- Speculative decoding across pipeline stages

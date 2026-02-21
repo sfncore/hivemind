@@ -16,8 +16,9 @@
 8. [Node0 ↔ Hivemind Integration Map](#8-node0--hivemind-integration-map)
 9. [Gap Analysis — Training](#9-gap-analysis--training)
 10. [Gap Analysis — Inference](#10-gap-analysis--inference)
-6. [Matchmaking & Group Formation](#6-matchmaking--group-formation)
-7. [Expert Routing — Batch Routing Between Pipeline Stages](#7-expert-routing--batch-routing-between-pipeline-stages)
+11. [Ecosystem — Petals, OpenDiLoCo & Prime Intellect](#11-ecosystem--petals-opendiloco--prime-intellect)
+12. [Architecture — The RL Flywheel](#12-architecture--the-rl-flywheel)
+13. [Proof of Concept — First Iteration](#13-proof-of-concept--first-iteration)
 
 ---
 
@@ -943,3 +944,408 @@ then process as one batch. No support for:
 - Adding new requests to an in-flight batch
 - Preempting long-running requests
 - Speculative decoding across pipeline stages
+
+---
+
+## 11. Ecosystem — Petals, OpenDiLoCo & Prime Intellect
+
+Projects built on Hivemind that are directly relevant to the Gas Town architecture.
+
+### 11.1 Petals (Inference + Fine-Tuning)
+
+**Repo:** https://github.com/bigscience-workshop/petals
+**Paper:** "Petals: Collaborative Inference and Fine-tuning of Large Models" (2022)
+
+Solves Hivemind's pipeline parallelism gap for inference. Hosts LLM layers as
+sequential pipeline stages across a swarm, with automatic routing and fault tolerance.
+
+| Feature | How it works |
+|---------|-------------|
+| Sequential pipeline | Each node hosts a range of transformer layers; client routes through them in order |
+| Inference | Client sends input → layer 0 node → layer 1 node → ... → output |
+| Fine-tuning | Frozen base model on swarm; client trains local LoRA adapters against remote activations |
+| Fault tolerance | If a node goes down, reroute through alternative nodes hosting same layers |
+| KV cache | Maintained server-side per session — solves Hivemind's stateless forward gap |
+
+**Relevance:** Petals provides the inference serving layer. Gas Town agents would hit a
+Petals-backed endpoint for completions rather than building pipeline routing from scratch.
+
+### 11.2 OpenDiLoCo / Prime Intellect (Distributed Training + RL)
+
+**Repo:** https://github.com/PrimeIntellect-ai/OpenDiloco
+**Paper:** "OpenDiLoCo: An Open-Source Framework for Globally Distributed Low-Communication Training" (2024)
+**Org:** https://www.primeintellect.ai/
+
+Built directly on Hivemind. Implements Google DeepMind's DiLoCo algorithm for
+low-communication distributed training.
+
+**How DiLoCo works:**
+1. Each worker trains independently for H steps using a local inner optimizer (AdamW)
+2. After H steps, workers compute pseudo-gradients (difference from starting point)
+3. An outer optimizer (SGD + Nesterov momentum) averages pseudo-gradients across workers
+4. Communication reduced by up to 500x vs standard distributed training
+5. Uses Hivemind's DHT for peer discovery, libp2p for comms — no master node
+
+**Demonstrated:** Training across two continents, three countries, 90-95% compute utilization.
+
+**Prime Intellect's training runs:**
+
+| Model | Params | Method | Date |
+|-------|--------|--------|------|
+| INTELLECT-1 | 10B | Decentralized pre-training (OpenDiLoCo on Hivemind) | 2024 |
+| INTELLECT-2 | 32B | Decentralized async RL — permissionless swarm | May 2025 |
+| INTELLECT-3 | 106B MoE (12B active) | Large-scale RL (centralized) | Nov 2025 |
+
+**INTELLECT-2 infrastructure (most relevant to Gas Town):**
+
+| Component | Purpose |
+|-----------|---------|
+| PRIME-RL | Async RL training framework — training nodes consume rollouts, produce updated policies |
+| SHARDCAST | Broadcasts updated policy weights from training nodes to inference workers |
+| TOPLOC | Verifies rollouts from untrusted inference workers |
+| Rust orchestrator | Coordinates global pool: hardware checks, heartbeats, task assignment, contribution tracking |
+
+**INTELLECT-2 data loop:**
+```
+Training nodes produce updated policy
+  → SHARDCAST broadcasts weights to inference workers
+  → Inference workers generate rollouts (math/coding tasks)
+  → TOPLOC verifies rollouts
+  → Verified rollouts feed back into RL training
+  → Repeat (fully async, no communication overhead)
+```
+
+### 11.3 Other Ecosystem Projects
+
+| Project | Relationship | Status |
+|---------|-------------|--------|
+| PyTorch Lightning | Hivemind strategy plugin for Lightning training loops | Active integration |
+| sahajBERT | Collaboratively pretrained Bengali ALBERT-xlarge | Research (2021) |
+| CALM | Collaborative Arabic Language Model | Research (2022) |
+| Training Transformers Together | NeurIPS 2021 demo — collaborative text-to-image | Research (2021) |
+| Hypermind | Fork with blockchain-based incentives | Early stage |
+| BitTensor | Similar concept but independent implementation (not built on Hivemind) | Active, separate ecosystem |
+
+---
+
+## 12. Architecture — The RL Flywheel
+
+### 12.1 Core Insight
+
+Gas Town agents do useful work (coding, research, planning) using LLM inference. Every
+inference call produces a (prompt, completion) pair. Every bead tracks whether that work
+succeeded or failed. This is a natural RL training signal — no synthetic benchmarks, no
+labeling teams, no separate data collection phase.
+
+The work IS the training data. The system does useful work and gets smarter as a side effect.
+
+### 12.2 The Loop
+
+```
+Gas Town agents request inference
+  → Hivemind swarm serves completions (Petals-style pipeline)
+  → Agents use completions to do real work
+  → Beads track outcomes (completed / failed / reworked)
+  → (prompt, completion, outcome) tuples queue as training data
+  → Swarm fine-tunes model on accumulated data (OpenDiLoCo-style)
+  → Updated adapters hot-swap into inference nodes
+  → Better model → better work → better training data → ...
+```
+
+### 12.3 Reward Signals
+
+Gas Town produces multiple quality signals without additional labeling effort:
+
+| Signal | Source | Strength | Latency |
+|--------|--------|----------|---------|
+| Bead completed first attempt | Beads tracker | Strong positive | Minutes to hours |
+| Bead required rework | Beads tracker | Weak negative | Minutes to hours |
+| Bead failed / abandoned | Beads tracker | Strong negative | Hours |
+| Mayor explicit approval | Human review | Strongest positive | Variable |
+| Mayor rejection / edit | Human review | Strongest negative | Variable |
+| Code compiles + tests pass | CI / verification | Strong positive (verifiable) | Minutes |
+| Agent self-correction | Agent retries in same session | Weak negative on first attempt | Immediate |
+
+This maps to standard RL formulations:
+- **RLHF / DPO:** Human preference from mayor approvals vs rejections
+- **GRPO / outcome-based RL:** Bead success/failure as binary reward
+- **Verifiable rewards:** Code compilation and test outcomes (like INTELLECT-2's math verification)
+
+### 12.4 Three Interlocking Flywheels
+
+**Data flywheel:** Useful work → training signal → better model → more useful work
+
+**Compute flywheel:** Contributors join swarm → more capacity → handle more work →
+attract more contributors
+
+**Quality flywheel:** Better model → fewer reworks → higher reward signal quality →
+more effective training → even better model
+
+### 12.5 Component Stack
+
+| Layer | Technology | Role |
+|-------|-----------|------|
+| Application | Gas Town (agents, beads, mayor) | Produces work + reward signals |
+| API gateway | OpenAI-compatible proxy | Routes agent requests to swarm |
+| Inference | Petals on Hivemind | Serves model across distributed nodes |
+| Data capture | Logging middleware in API gateway | Records (prompt, completion, metadata) |
+| Reward | Beads outcome tracker | Maps bead results to scalar rewards |
+| Training | OpenDiLoCo / PRIME-RL on Hivemind | Distributed RL fine-tuning |
+| Sync | SHARDCAST-style broadcast | Pushes updated adapters to inference nodes |
+| Orchestration | Hivemind DHT + coordinator | Peer discovery, health, task assignment |
+
+### 12.6 Why Fine-Tuning, Not Full Training
+
+Target hardware is 16GB VRAM nodes. With QLoRA:
+- Frozen base model (int4 quantized): ~0.5 bytes/param → 7B model fits in ~3.5GB
+- LoRA adapters (trainable): 0.1-1% of base params → tiny
+- Adapter gradients + optimizer states: ~18 bytes per adapter param only → small
+- Remaining VRAM for activations and KV cache
+
+7B-13B models fine-tune comfortably on 16GB. No pipeline parallelism needed when each
+node holds the full frozen model. Hivemind's data-parallel `Optimizer` +
+`DecentralizedAverager` handles gradient averaging across adapter weights.
+
+For the RL loop specifically: each node generates rollouts (inference) using QLoRA model,
+computes rewards from bead outcomes, and trains adapter gradients. Hivemind averages
+adapter gradients across the swarm. This is the same pattern as INTELLECT-2 but with
+real work instead of synthetic benchmarks.
+
+---
+
+## 13. Proof of Concept — First Iteration
+
+Minimal viable iteration to validate the flywheel on a single machine before distributing.
+
+### 13.1 Scope
+
+**Goal:** Demonstrate that Gas Town agent work produces usable RL training signal, and that
+fine-tuning on that signal measurably improves the model at Gas Town tasks.
+
+**Not in scope for PoC:** Multi-node distribution, Petals pipeline, SHARDCAST, NAT
+traversal, untrusted compute. Those are scaling concerns — validate the loop first.
+
+### 13.2 Architecture (Single Node)
+
+```
+┌─────────────────────────────────────────────────┐
+│                  Single Machine                  │
+│                                                  │
+│  ┌──────────┐    ┌──────────────┐               │
+│  │ Gas Town │───▶│  Local vLLM  │               │
+│  │  Agents  │◀───│  (7B QLoRA)  │               │
+│  └────┬─────┘    └──────────────┘               │
+│       │                  ▲                       │
+│       │ bead outcomes    │ adapter swap           │
+│       ▼                  │                       │
+│  ┌──────────┐    ┌──────────────┐               │
+│  │  Data    │───▶│   QLoRA      │               │
+│  │  Logger  │    │   Trainer    │               │
+│  └──────────┘    └──────────────┘               │
+│                                                  │
+└─────────────────────────────────────────────────┘
+```
+
+### 13.3 Components to Build
+
+**Step 1: Local inference server**
+
+Run a 7B model (e.g., Qwen-2.5-7B, Llama-3.1-8B) with QLoRA on a single GPU using
+vLLM or llama.cpp. Expose an OpenAI-compatible API endpoint.
+
+```bash
+# Example with vLLM
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --quantization awq \
+    --enable-lora \
+    --lora-modules gastown-adapter=./adapters/gastown-v0 \
+    --port 8000
+```
+
+Deliverable: Gas Town agents can hit `http://localhost:8000/v1/chat/completions`
+instead of (or alongside) Claude API.
+
+**Step 2: Data capture middleware**
+
+A thin proxy or logging layer between Gas Town agents and the inference server.
+Captures every request/response pair with metadata.
+
+```python
+# Minimal data logger — captures inference calls
+import json, time, uuid
+from pathlib import Path
+
+DATA_DIR = Path("./training_data")
+
+def log_inference(prompt: str, completion: str, metadata: dict) -> str:
+    """Log a single inference call. Returns log ID."""
+    log_id = str(uuid.uuid4())[:8]
+    record = {
+        "id": log_id,
+        "timestamp": time.time(),
+        "prompt": prompt,
+        "completion": completion,
+        "metadata": metadata,  # agent name, bead ID, task type
+        "reward": None,        # filled in later by reward mapper
+    }
+    (DATA_DIR / f"{log_id}.json").write_text(json.dumps(record))
+    return log_id
+```
+
+Deliverable: Every inference call produces a JSON record with prompt, completion, and
+a slot for reward signal.
+
+**Step 3: Reward mapper**
+
+Connects bead outcomes to inference logs. When a bead completes or fails, look up which
+inference calls were made during that bead's execution and assign rewards.
+
+```python
+# Reward mapper — connects bead outcomes to training data
+REWARD_MAP = {
+    "completed_first_attempt": 1.0,
+    "completed_after_rework": 0.3,
+    "failed": -0.5,
+    "abandoned": -1.0,
+    "mayor_approved": 1.5,
+    "mayor_rejected": -1.0,
+    "tests_passed": 0.5,   # bonus signal
+    "tests_failed": -0.3,  # partial negative
+}
+
+def assign_rewards(bead_id: str, outcome: str):
+    """Find all inference logs for this bead and assign reward."""
+    reward = REWARD_MAP.get(outcome, 0.0)
+    for log_file in DATA_DIR.glob("*.json"):
+        record = json.loads(log_file.read_text())
+        if record["metadata"].get("bead_id") == bead_id:
+            record["reward"] = reward
+            log_file.write_text(json.dumps(record))
+```
+
+Deliverable: Inference logs get reward values based on bead outcomes.
+
+**Step 4: QLoRA fine-tuning script**
+
+Periodically trains LoRA adapters on accumulated (prompt, completion, reward) data.
+For the PoC, this can be a simple offline script run manually or on a cron.
+
+```python
+# Simplified — actual implementation would use trl + peft
+from trl import GRPOTrainer, GRPOConfig
+from peft import LoraConfig
+
+# Load accumulated training data
+dataset = load_reward_dataset("./training_data/")
+
+# Configure LoRA
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+    lora_dropout=0.05,
+)
+
+# GRPO: Group Relative Policy Optimization
+# Uses reward signal directly, no separate reward model needed
+training_config = GRPOConfig(
+    output_dir="./adapters/gastown-v1",
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,
+    num_train_epochs=1,
+    learning_rate=2e-5,
+)
+
+trainer = GRPOTrainer(
+    model=base_model,
+    config=training_config,
+    peft_config=lora_config,
+    train_dataset=dataset,
+)
+trainer.train()
+trainer.save_model("./adapters/gastown-v1")
+```
+
+Deliverable: A new adapter checkpoint trained on Gas Town's own data.
+
+**Step 5: Adapter hot-swap**
+
+Load the new adapter into the running inference server without restart.
+
+```bash
+# vLLM supports dynamic LoRA loading
+curl -X POST http://localhost:8000/v1/load_lora \
+    -d '{"lora_name": "gastown-adapter", "lora_path": "./adapters/gastown-v1"}'
+```
+
+Or for llama.cpp / Ollama, swap the adapter file and reload.
+
+Deliverable: Inference server now uses the fine-tuned adapter. Loop complete.
+
+### 13.4 Validation Metrics
+
+How to know the flywheel is working:
+
+| Metric | Measure | Target for PoC |
+|--------|---------|----------------|
+| Bead success rate | % beads completed first attempt, before vs after fine-tune | Any measurable improvement |
+| Rework rate | % beads requiring rework, before vs after | Decrease |
+| Reward trend | Average reward per batch over time | Upward trend |
+| Completion quality | Human eval (mayor) of random samples | Subjective improvement |
+| Task-specific perf | Code compilation rate, test pass rate | Improvement on code tasks |
+
+**Baseline:** Run Gas Town on the stock model for N beads. Record metrics.
+**Treatment:** Run Gas Town on the fine-tuned model for N beads. Compare.
+
+### 13.5 Minimum Hardware
+
+| Component | Requirement |
+|-----------|------------|
+| GPU | 1x 16GB+ (RTX 4060 Ti 16GB, RTX 3090, A4000, etc.) |
+| RAM | 32GB+ (optimizer offload, data loading) |
+| Storage | 50GB+ (model weights, training data, adapter checkpoints) |
+| Software | vLLM or llama.cpp, PyTorch, PEFT, TRL |
+
+### 13.6 PoC → Distributed (What Comes After)
+
+Once the single-node flywheel is validated:
+
+| Step | What changes | Technology |
+|------|-------------|-----------|
+| 1. Multi-node inference | Model hosted across nodes instead of single GPU | Petals on Hivemind |
+| 2. Distributed fine-tuning | Multiple nodes train adapters, average gradients | OpenDiLoCo / Hivemind Optimizer |
+| 3. Async RL loop | Training and inference overlap continuously | PRIME-RL pattern |
+| 4. Adapter broadcast | Push updated adapters to all inference nodes | SHARDCAST-style on Hivemind DHT |
+| 5. Permissionless compute | Anyone can contribute GPU to the swarm | Hivemind P2P + auth |
+| 6. Untrusted verification | Verify rollouts from unknown contributors | TOPLOC-style verification |
+
+Each step is independently valuable. Step 1 alone gives decentralized inference.
+Steps 1+2 give the distributed flywheel. Steps 3-6 are scaling and hardening.
+
+### 13.7 Open Questions for PoC
+
+1. **Base model selection:** Qwen-2.5-7B-Instruct vs Llama-3.1-8B-Instruct vs
+   DeepSeek-R1-Distill-7B? Needs benchmarking on Gas Town task types (code, planning,
+   research). Code-specialized models may have better starting performance.
+
+2. **RL algorithm:** GRPO (no reward model needed, uses group relative ranking) vs
+   DPO (needs preference pairs — could construct from mayor approve/reject) vs
+   simple SFT on successful completions only (lowest complexity, may be sufficient
+   for PoC).
+
+3. **Training frequency:** How many bead completions before a fine-tuning round?
+   Too few = noisy gradients. Too many = slow feedback loop. Start with batches
+   of ~100 completed beads and adjust.
+
+4. **Evaluation gate:** Should updated adapters be eval'd before deployment, or
+   deploy immediately and monitor? For PoC, a simple perplexity check + manual
+   spot-check is probably sufficient. Production needs automated eval.
+
+5. **Data mix:** Pure Gas Town data vs Gas Town data mixed with general instruction
+   data? Pure risks catastrophic forgetting of general capabilities. A 50/50 mix
+   with a general dataset (like OpenHermes) is safer.
+
+6. **Which Gas Town tasks to start with:** Code-heavy tasks have the clearest
+   reward signal (compiles/doesn't compile, tests pass/fail). Research and planning
+   tasks have noisier rewards. Start with code tasks for clearest signal.

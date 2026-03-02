@@ -14,6 +14,8 @@
 {"issue_id":"hq-t5m","label":"from:claudecode/refinery"}
 {"issue_id":"hq-t5m","label":"gt:message"}
 {"issue_id":"hq-t5m","label":"read"}
+{"issue_id":"hq-udb","label":"from:sfgastown/witness"}
+{"issue_id":"hq-udb","label":"gt:message"}
 {"issue_id":"hq-wisp-298y","label":"gt:escalation"}
 {"issue_id":"hq-wisp-298y","label":"severity:high"}
 {"issue_id":"hq-wisp-5j9h7","label":"delivery-acked-at:2026-03-02T10:10:34Z"}

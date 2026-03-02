@@ -82,3 +82,12 @@ hivemind/proto/*_pb2*
 
 # libp2p-daemon binary
 hivemind/hivemind_cli/p2pd
+
+# Gas Town (added by gt)
+.runtime/
+.claude/commands/
+.logs/
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
